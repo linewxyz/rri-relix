@@ -92,9 +92,19 @@ function App(){
    await engine.exec(['-i','relix-source','-vn','-ac','1','-ar','16000','-c:a','pcm_s16le','relix-audio.wav'])
    const audio=await engine.readFile('relix-audio.wav')
    setPhase('AI transcription');setStatus('Whisper sedang mengenali percakapan. Durasi proses bergantung pada perangkat.')
-   const result=await transcriber(new Blob([audio.buffer],{type:'audio/wav'}),{
-    chunk_length_s:30,stride_length_s:5,return_timestamps:'chunk',language:'indonesian',task:'transcribe'
-   })
+  const audioContext = new AudioContext()
+const audioBuffer = await audioContext.decodeAudioData(audio.slice().buffer)
+const samples = audioBuffer.getChannelData(0)
+
+const result = await transcriber(samples, {
+  chunk_length_s: 30,
+  stride_length_s: 5,
+  return_timestamps: 'chunk',
+  language: 'indonesian',
+  task: 'transcribe'
+})
+
+await audioContext.close()
    const candidates=groupHighlights(result.chunks||[],duration)
    if(!candidates.length)throw new Error('Transkrip tidak menghasilkan segmen bertimestamp. Coba video dengan audio percakapan yang jelas.')
    setClips(candidates);setStatus(`Analisis selesai. ${candidates.length} kandidat highlight dibuat. Pilih klip yang ingin diunduh.`)
