@@ -8,7 +8,7 @@ import './style.css'
 
 env.allowLocalModels = false
 env.useBrowserCache = true
-const FFMPEG_CORE = 'https://unpkg.com/@ffmpeg/core@0.12.10/dist/umd'
+const FFMPEG_CORE = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/esm'
 const ASR_MODEL = 'onnx-community/whisper-tiny'
 
 const fmt = n => {
