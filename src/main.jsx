@@ -9,7 +9,7 @@ import './style.css'
 env.allowLocalModels = false
 env.useBrowserCache = true
 const FFMPEG_CORE = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/esm'
-const ASR_MODEL = 'onnx-community/whisper-tiny'
+const ASR_MODEL = 'onnx-community/whisper-small'
 const MAX_SECONDS = 3600          // 60 menit
 const MAX_LONG_SIDE = 1920        // 1080p (landscape maupun portrait)
 const MAX_SHORT_SIDE = 1080
@@ -83,6 +83,11 @@ function smoothPath(focus, step, cropLen, srcLen) {
   })
 }
 
+// Gerakan kamera cadangan: pan linear dari satu sisi ke sisi lain sepanjang klip.
+function sweepTrack(len, cropLen, srcLen) {
+  return { times: [0, len], pos: [0, Math.max(0, srcLen - cropLen)], found: 0 }
+}
+
 // Deteksi subjek pada beberapa titik waktu klip, hasilnya posisi crop per keyframe.
 async function trackSubject({ video, detector, clip, end, geo, srcW, srcH, onProgress }) {
   const { cw, ch, axis } = geo
@@ -110,8 +115,11 @@ async function trackSubject({ video, detector, clip, end, geo, srcW, srcH, onPro
     focus.push(f)
     onProgress?.(Math.round((i + 1) / times.length * 100))
   }
-  const pos = smoothPath(focus, SAMPLE_STEP, axis === 'x' ? cw : ch, axis === 'x' ? srcW : srcH)
-  return { times, pos, found: focus.filter(v => v != null).length }
+  const cropLen = axis === 'x' ? cw : ch, srcLen = axis === 'x' ? srcW : srcH
+  const found = focus.filter(v => v != null).length
+  // Tidak ada orang terdeteksi sama sekali: pan perlahan dari kiri ke kanan (atau atas ke bawah).
+  if (!found) return sweepTrack(len, cropLen, srcLen)
+  return { times, pos: smoothPath(focus, SAMPLE_STEP, cropLen, srcLen), found }
 }
 
 // Ekspresi ffmpeg linear antar keyframe: posisi crop sebagai fungsi waktu t.
@@ -156,6 +164,44 @@ function wavToFloat32(bytes) {
   return out
 }
 
+// Judul klip otomatis dari kata kunci transkrip (nama/istilah yang sering muncul).
+const STOPWORDS = new Set(('yang dan di ke dari untuk dengan ini itu adalah akan atau pada dalam juga tidak ada kami kita saya anda ' +
+  'mereka dia kamu bisa dapat sudah telah belum masih sangat lebih agar supaya sebagai oleh karena tetapi namun jika kalau maka ' +
+  'sehingga bahwa para suatu setiap semua berbagai antara tentang lalu kemudian selain seperti saat ketika sebuah hal nya lah kah ' +
+  'pun saja hanya harus mau ingin sedang pernah bagi serta terhadap secara hingga sampai selama setelah sebelum menjadi merupakan ' +
+  'yaitu yakni dimana mana siapa apa bagaimana mengapa kenapa iya bukan jangan sama lain lainnya banyak beberapa sekitar punya ' +
+  'memiliki melakukan dilakukan membuat dibuat berdasarkan sebagai dapat akan juga terus selalu sekarang nanti tadi dulu kembali ' +
+  'terima kasih selamat pagi siang sore malam bapak ibu hadirin').split(' '))
+
+function makeTitle(text, fallback) {
+  const words = (text || '').split(/\s+/).filter(Boolean)
+  const stat = new Map()
+  words.forEach((raw, i) => {
+    const w = raw.replace(/^[^A-Za-zÀ-ÿ]+|[^A-Za-zÀ-ÿ]+$/g, '')
+    const isAcr = /^[A-Z]{3,}$/.test(w)
+    if (w.length < 5 && !isAcr) return
+    const key = w.toLowerCase()
+    if (STOPWORDS.has(key)) return
+    const prevEnds = i === 0 || /[.!?]$/.test(words[i - 1])
+    const isProper = isAcr || (/^[A-Z]/.test(w) && !prevEnds)
+    const e = stat.get(key) || { word: w, count: 0, proper: false, acr: false, first: i }
+    e.count++; e.proper ||= isProper; e.acr ||= isAcr
+    stat.set(key, e)
+  })
+  const ranked = [...stat.values()]
+    .map(e => ({ ...e, score: e.count * (e.proper ? 2 : 1) * (1 + Math.min(e.word.length, 10) / 20) }))
+    .sort((a, b) => b.score - a.score || a.first - b.first)
+  const pick = []
+  for (const e of ranked) { if (pick.length < 3) pick.push(e) }
+  if (!pick.length) return fallback
+  pick.sort((a, b) => a.first - b.first)
+  const cap = e => e.acr ? e.word.toUpperCase() : e.word.charAt(0).toUpperCase() + e.word.slice(1).toLowerCase()
+  const join = list => list.length > 1 ? `${list.slice(0, -1).join(', ')} dan ${list[list.length - 1]}` : list[0]
+  let items = pick.map(cap), title = `Membahas ${join(items)}`
+  while (title.length > 60 && items.length > 1) { items = items.slice(0, -1); title = `Membahas ${join(items)}` }
+  return title
+}
+
 function groupHighlights(chunks, totalDuration) {
   const usable = (chunks || []).map(c => {
     const s = c.timestamp?.[0] ?? c.start ?? 0
@@ -189,7 +235,7 @@ function groupHighlights(chunks, totalDuration) {
       ...g, id: crypto.randomUUID(), score, rendered: false, url: ''
     }
   }).sort((a, b) => b.score - a.score).slice(0, 12)
-    .map((g, i) => ({ ...g, title: `Highlight ${String(i + 1).padStart(2, '0')}` })) // nomor mengikuti urutan skor
+    .map((g, i) => ({ ...g, title: makeTitle(g.text, `Highlight ${String(i + 1).padStart(2, '0')}`) }))
 }
 
 function App() {
@@ -347,8 +393,7 @@ function App() {
             let track = { times: [0, len], pos: [0, 0] }
             if (geo.axis) {
               const axisLen = geo.axis === 'x' ? srcW : srcH, cropLen = geo.axis === 'x' ? geo.cw : geo.ch
-              const centered = (axisLen - cropLen) / 2
-              track = { times: [0, len], pos: [centered, centered] }
+              track = sweepTrack(len, cropLen, axisLen)   // cadangan jika model deteksi tidak tersedia
               if (detector) {
                 setPhase(`Reframing klip ${i + 1}/${candidates.length}`); setProgress(0)
                 setStatus(`Mencari subjek utama di ${c.title}...`)
@@ -417,19 +462,18 @@ function App() {
         </div>
         <div className="panel"><div className="panelhead"><div><small>02 / AI ENGINE</small><h2>Analyze broadcast</h2></div><Sparkles /></div>
           <div className="ai-card"><div className="ai-icon"><WandSparkles /></div><div><b>Whisper AI · Multilingual</b><p>Transkripsi Bahasa Indonesia, deteksi highlight, lalu klip otomatis dipotong portrait 9:16 dengan auto-reframe mengikuti subjek.</p></div></div>
-          <div className="modelrow"><span><Cpu size={15} /> AI model</span><b>{modelReady ? 'Loaded in browser' : 'Whisper Tiny · multilingual'}</b></div>
+          <div className="modelrow"><span><Cpu size={15} /> AI model</span><b>{modelReady ? 'Loaded in browser' : 'Whisper Small · multilingual'}</b></div>
           <button className="primary" onClick={transcribe} disabled={!file || !duration || busy}><Sparkles size={16} />{busy ? 'AI sedang bekerja...' : 'Generate AI Highlights'}</button>
           <p className="hint">Model AI diunduh saat pertama kali digunakan dan tersimpan di cache browser. Jangan tutup tab selama proses berjalan.</p>
         </div>
       </section>
       <section className="panel results">
-        <div className="resulthead"><div><small>03 / AI OUTPUT</small><h2>Highlight results <em>{clips.length}</em></h2><p>Klip dirender otomatis dalam format portrait 9:16 dengan auto-reframe pada subjek. Unduh MP4 yang diinginkan.</p></div><button className="outline" onClick={clear} disabled={!file || busy}><Trash2 size={14} /> Clear</button></div>
+        <div className="resulthead"><div><small>03 / AI OUTPUT</small><h2>Highlight results <em>{clips.length}</em></h2><p>Klip dirender otomatis dalam format portrait 9:16 dengan auto-reframe pada subjek. Judul klip bisa diedit sebelum diunduh.</p></div><button className="outline" onClick={clear} disabled={!file || busy}><Trash2 size={14} /> Clear</button></div>
         {!clips.length ? <div className="empty"><div><Scissors size={25} /></div><b>No highlights generated</b><span>Upload video lalu jalankan AI untuk menemukan kandidat momen menarik.</span></div> :
           <div className="clipgrid">{clips.map((c, i) => <article className="clip chosen" key={c.id}>
             <div className="cliptop"><b>HIGHLIGHT {String(i + 1).padStart(2, '0')}</b><span className="score">AI {c.score}%</span></div>
             <input className="titleinput" value={c.title} onChange={e => update(c.id, { title: e.target.value })} />
             <div className="clipmeta"><span><Clock3 size={13} />{fmt(c.start)} – {fmt(c.end)}</span><span>{fmt(c.end - c.start)}</span></div>
-            <div className="transcript">{c.text}</div>
             {c.url && <video className="preview" src={c.url} controls style={{ maxHeight: 460, aspectRatio: "9 / 16", margin: "0 auto", display: "block", background: "#000" }} />}
             <div className="clipbuttons">
               {c.rendered
