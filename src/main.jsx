@@ -135,6 +135,27 @@ function buildFilter(geo, expr) {
   return `crop=w=${cw}:h=${ch}:x=${x}:y=${y},scale=${OUT_W}:${OUT_H}:flags=bicubic,setsar=1,format=yuv420p`
 }
 
+const safe = s => (s || 'rri-relix').replace(/\.[^.]+$/, '').replace(/[^a-z0-9-_]+/gi, '-').toLowerCase()
+
+// Decode WAV PCM16 mono 16 kHz langsung ke Float32Array.
+// (AudioContext.decodeAudioData akan me-resample ke 44.1/48 kHz sehingga Whisper salah baca.)
+function wavToFloat32(bytes) {
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+  let pos = 12, start = -1, len = 0
+  while (pos + 8 <= bytes.byteLength) {
+    const id = String.fromCharCode(bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3])
+    const size = dv.getUint32(pos + 4, true)
+    if (id === 'data') { start = pos + 8; len = Math.min(size, bytes.byteLength - start); break }
+    pos += 8 + size + (size % 2)
+  }
+  if (start < 0) throw new Error('Data audio WAV tidak ditemukan. Video mungkin tidak memiliki audio.')
+  const n = len >> 1
+  if (n < 16000) throw new Error('Audio terlalu pendek atau kosong.')
+  const out = new Float32Array(n)
+  for (let i = 0; i < n; i++) out[i] = dv.getInt16(start + i * 2, true) / 32768
+  return out
+}
+
 function groupHighlights(chunks, totalDuration) {
   const usable = (chunks || []).map(c => {
     const s = c.timestamp?.[0] ?? c.start ?? 0
