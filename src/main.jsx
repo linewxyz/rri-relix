@@ -3,7 +3,7 @@ import { createRoot } from 'react-dom/client'
 import { FFmpeg } from '@ffmpeg/ffmpeg'
 import { fetchFile, toBlobURL } from '@ffmpeg/util'
 import { pipeline, env } from '@huggingface/transformers'
-import { UploadCloud, Sparkles, Scissors, Captions, Download, Trash2, CheckCircle2, LoaderCircle, FileVideo2, WandSparkles, X, Clock3, Cpu } from 'lucide-react'
+import { UploadCloud, Sparkles, Scissors, Download, Trash2, CheckCircle2, LoaderCircle, FileVideo2, WandSparkles, X, Clock3, Cpu } from 'lucide-react'
 import './style.css'
 
 env.allowLocalModels = false
@@ -15,14 +15,84 @@ const MAX_LONG_SIDE = 1920        // 1080p (landscape maupun portrait)
 const MAX_SHORT_SIDE = 1080
 const MAX_FILE_MB = 1024          // batas aman memori WASM FFmpeg
 
+// Output selalu portrait 9:16. 720x1280 dipilih agar render di browser tidak terlalu lambat;
+// ubah ke 1080 x 1920 jika perangkat kuat.
+const OUT_W = 720, OUT_H = 1280
+// 'blur'  = video utuh di tengah, latar blur (tidak ada bagian yang terpotong)
+// 'crop'  = video memenuhi layar, sisi kiri/kanan terpotong
+const PORTRAIT_MODE = 'blur'
+const SUB_H = 260                 // tinggi gambar subtitle
+const SUB_BOTTOM = 190            // jarak subtitle dari tepi bawah
+
 const fmt = n => {
   n = Math.max(0, Number(n) || 0)
   return `${String(Math.floor(n / 60)).padStart(2, '0')}:${String(Math.floor(n % 60)).padStart(2, '0')}`
 }
-const srtTime = n => {
-  n = Math.max(0, n)
-  const t = Math.floor(n), ms = Math.min(999, Math.round((n - t) * 1000))
-  return `${String(Math.floor(t / 3600)).padStart(2, '0')}:${String(Math.floor(t % 3600 / 60)).padStart(2, '0')}:${String(t % 60).padStart(2, '0')},${String(ms).padStart(3, '0')}`
+// Pecah segmen Whisper menjadi cue pendek (maks. ~7 kata) dengan waktu proporsional.
+function makeCues(subtitle, clipLen, maxWords = 7) {
+  const cues = []
+  for (const s of subtitle || []) {
+    const words = (s.text || '').split(/\s+/).filter(Boolean)
+    if (!words.length) continue
+    const n = Math.ceil(words.length / maxWords), size = Math.ceil(words.length / n)
+    const groups = []
+    for (let i = 0; i < words.length; i += size) groups.push(words.slice(i, i + size).join(' '))
+    const total = groups.reduce((a, g) => a + g.length, 0)
+    const segEnd = Math.min(s.end, clipLen)
+    let t = Math.max(0, s.start)
+    const dur = Math.max(0.3, segEnd - t)
+    for (const g of groups) {
+      const share = dur * g.length / total
+      cues.push({ start: t, end: Math.min(clipLen, t + share), text: g })
+      t += share
+    }
+  }
+  return cues.filter(c => c.end - c.start > 0.1)
+}
+
+// Gambar teks subtitle (putih, outline hitam) ke PNG transparan memakai canvas browser,
+// jadi tidak butuh font/libass di FFmpeg.
+async function cueToPng(text) {
+  const cv = document.createElement('canvas')
+  cv.width = OUT_W; cv.height = SUB_H
+  const ctx = cv.getContext('2d')
+  const fontSize = 40, lineH = 50, maxW = OUT_W - 80
+  ctx.font = `800 ${fontSize}px "Segoe UI", Roboto, Arial, sans-serif`
+  ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic'
+  ctx.lineJoin = 'round'
+  const lines = []; let line = ''
+  for (const w of text.split(' ')) {
+    const test = line ? line + ' ' + w : w
+    if (line && ctx.measureText(test).width > maxW) { lines.push(line); line = w } else line = test
+  }
+  if (line) lines.push(line)
+  const shown = lines.slice(-4)
+  // rata bawah: baris terakhir selalu di posisi yang sama
+  let y = SUB_H - 24 - (shown.length - 1) * lineH
+  for (const l of shown) {
+    ctx.lineWidth = 9; ctx.strokeStyle = 'rgba(0,0,0,.95)'; ctx.strokeText(l, OUT_W / 2, y)
+    ctx.fillStyle = '#fff'; ctx.fillText(l, OUT_W / 2, y)
+    y += lineH
+  }
+  const blob = await new Promise(r => cv.toBlob(r, 'image/png'))
+  return new Uint8Array(await blob.arrayBuffer())
+}
+
+// Filter FFmpeg: ubah ke portrait 9:16 lalu tempel gambar subtitle sesuai waktu.
+function buildFilter(cues) {
+  const base = PORTRAIT_MODE === 'crop'
+    ? `[0:v:0]scale=${OUT_W}:${OUT_H}:force_original_aspect_ratio=increase,crop=${OUT_W}:${OUT_H},setsar=1[v0]`
+    : `[0:v:0]split=2[a][b];` +
+      `[a]scale=90:160:force_original_aspect_ratio=increase,crop=90:160,boxblur=2:1,scale=${OUT_W}:${OUT_H},setsar=1[bg];` +
+      `[b]scale=${OUT_W}:${OUT_H}:force_original_aspect_ratio=decrease,setsar=1[fg];` +
+      `[bg][fg]overlay=(W-w)/2:(H-h)/2[v0]`
+  const y = OUT_H - SUB_H - SUB_BOTTOM
+  let g = base
+  cues.forEach((c, i) => {
+    g += `;[v${i}][${i + 1}:v]overlay=0:${y}:enable='between(t,${c.start.toFixed(2)},${c.end.toFixed(2)})'[v${i + 1}]`
+  })
+  g += `;[v${cues.length}]format=yuv420p[vout]`
+  return g
 }
 const safe = s => (s || 'rri-relix').replace(/\.[^.]+$/, '').replace(/[^a-z0-9-_]+/gi, '-').toLowerCase()
 
@@ -205,13 +275,25 @@ function App() {
       for (let i = 0; i < candidates.length; i++) {
         const c = candidates[i], out = `clip-${i}.mp4`
         setPhase(`Render klip ${i + 1}/${candidates.length}`); setProgress(0)
-        setStatus(`Memotong ${c.title} (${fmt(c.start)} – ${fmt(c.end)})...`)
+        setStatus(`Membuat video portrait + subtitle: ${c.title} (${fmt(c.start)} – ${fmt(c.end)})...`)
+        const pngs = []
         try {
           const end = duration ? Math.min(c.end, duration) : c.end
+          const len = end - c.start
+          const cues = makeCues(c.subtitle, len)
+          const inputs = ['-ss', String(c.start), '-i', src]
+          for (let k = 0; k < cues.length; k++) {
+            const name = `cue-${i}-${k}.png`
+            await engine.writeFile(name, await cueToPng(cues[k].text))
+            pngs.push(name)
+            inputs.push('-i', name)
+          }
           const rc2 = await engine.exec([
-            '-ss', String(c.start), '-i', src, '-t', String(end - c.start),
-            '-map', '0:v:0', '-map', '0:a?',
-            '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '24', '-pix_fmt', 'yuv420p',
+            ...inputs, '-t', String(len),
+            '-filter_complex', buildFilter(cues),
+            '-map', '[vout]', '-map', '0:a?',
+            '-r', '30',
+            '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '25',
             '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', out
           ])
           if (rc2 !== 0) throw new Error('ffmpeg gagal')
@@ -222,6 +304,7 @@ function App() {
           console.error(e); failed++
         } finally {
           await engine.deleteFile(out).catch(() => {})
+          for (const n of pngs) await engine.deleteFile(n).catch(() => {})
         }
       }
       setStatus(failed
@@ -243,11 +326,6 @@ function App() {
     if (!c.url) return
     const a = document.createElement('a'); a.href = c.url; a.download = `${safe(c.title)}.mp4`; a.click()
   }
-  function downloadSrt(c) {
-    const body = c.subtitle.map((s, i) => `${i + 1}\n${srtTime(s.start)} --> ${srtTime(s.end)}\n${s.text}\n`).join('\n')
-    const a = document.createElement('a'), u = URL.createObjectURL(new Blob([body], { type: 'text/plain;charset=utf-8' }))
-    a.href = u; a.download = `${safe(c.title)}.srt`; a.click(); setTimeout(() => URL.revokeObjectURL(u), 1000)
-  }
   function clear() {
     if (busy) return
     if (clips.some(c => c.url) && !window.confirm('Klip yang belum diunduh akan hilang. Lanjutkan?')) return
@@ -265,27 +343,25 @@ function App() {
           <input ref={inputRef} hidden type="file" accept="video/*" onChange={e => selectFile(e.target.files?.[0])} />
         </div>
         <div className="panel"><div className="panelhead"><div><small>02 / AI ENGINE</small><h2>Analyze broadcast</h2></div><Sparkles /></div>
-          <div className="ai-card"><div className="ai-icon"><WandSparkles /></div><div><b>Whisper AI · Multilingual</b><p>Transkripsi otomatis Bahasa Indonesia, deteksi kandidat highlight, lalu klip dipotong otomatis.</p></div></div>
+          <div className="ai-card"><div className="ai-icon"><WandSparkles /></div><div><b>Whisper AI · Multilingual</b><p>Transkripsi Bahasa Indonesia, deteksi highlight, lalu klip otomatis dibuat portrait 9:16 dengan subtitle tertanam.</p></div></div>
           <div className="modelrow"><span><Cpu size={15} /> AI model</span><b>{modelReady ? 'Loaded in browser' : 'Whisper Tiny · multilingual'}</b></div>
           <button className="primary" onClick={transcribe} disabled={!file || !duration || busy}><Sparkles size={16} />{busy ? 'AI sedang bekerja...' : 'Generate AI Highlights'}</button>
           <p className="hint">Model AI diunduh saat pertama kali digunakan dan tersimpan di cache browser. Jangan tutup tab selama proses berjalan.</p>
         </div>
       </section>
       <section className="panel results">
-        <div className="resulthead"><div><small>03 / AI OUTPUT</small><h2>Highlight results <em>{clips.length}</em></h2><p>Klip dirender otomatis. Unduh MP4 dan SRT yang diinginkan.</p></div><button className="outline" onClick={clear} disabled={!file || busy}><Trash2 size={14} /> Clear</button></div>
+        <div className="resulthead"><div><small>03 / AI OUTPUT</small><h2>Highlight results <em>{clips.length}</em></h2><p>Klip dirender otomatis dalam format portrait 9:16 dengan subtitle tertanam. Unduh MP4 yang diinginkan.</p></div><button className="outline" onClick={clear} disabled={!file || busy}><Trash2 size={14} /> Clear</button></div>
         {!clips.length ? <div className="empty"><div><Scissors size={25} /></div><b>No highlights generated</b><span>Upload video lalu jalankan AI untuk menemukan kandidat momen menarik.</span></div> :
           <div className="clipgrid">{clips.map((c, i) => <article className="clip chosen" key={c.id}>
             <div className="cliptop"><b>HIGHLIGHT {String(i + 1).padStart(2, '0')}</b><span className="score">AI {c.score}%</span></div>
             <input className="titleinput" value={c.title} onChange={e => update(c.id, { title: e.target.value })} />
             <div className="clipmeta"><span><Clock3 size={13} />{fmt(c.start)} – {fmt(c.end)}</span><span>{fmt(c.end - c.start)}</span></div>
             <div className="transcript">{c.text}</div>
-            <details><summary>Edit subtitle transcript</summary><textarea value={c.subtitle.map(s => s.text).join('\n')} onChange={e => { const lines = e.target.value.split('\n'); update(c.id, { subtitle: c.subtitle.map((s, j) => ({ ...s, text: lines[j] ?? '' })) }) }} /></details>
-            {c.url && <video className="preview" src={c.url} controls />}
+            {c.url && <video className="preview" src={c.url} controls style={{ maxHeight: 460, aspectRatio: "9 / 16", margin: "0 auto", display: "block", background: "#000" }} />}
             <div className="clipbuttons">
               {c.rendered
                 ? <button className="download" onClick={() => download(c)}><Download size={14} /> Download MP4</button>
                 : <span className="hint">{busy ? 'Menunggu proses otomatis...' : 'Render gagal'}</span>}
-              <button className="srt" onClick={() => downloadSrt(c)}><Captions size={14} /> SRT</button>
             </div>
           </article>)}</div>}
         {busy && <div className="progress"><div><span><LoaderCircle className="spin" size={14} /> {phase || 'Processing'}</span><b>{progress}%</b></div><div className="track"><i style={{ width: `${progress}%` }} /></div></div>}
