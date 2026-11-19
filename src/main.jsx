@@ -18,9 +18,17 @@ const MAX_FILE_MB = 1024          // batas aman memori WASM FFmpeg
 // Output selalu portrait 9:16. 720x1280 dipilih agar render di browser tidak terlalu lambat;
 // ubah ke 1080 x 1920 jika perangkat kuat.
 const OUT_W = 720, OUT_H = 1280
-const DETECT_MODEL = 'Xenova/yolos-tiny'   // deteksi orang untuk auto-reframe
 const SAMPLE_STEP = 1.5                     // deteksi subjek setiap 1,5 detik
-const DETECT_WIDTH = 512                    // lebar frame yang dianalisis
+
+// Model AI tambahan (semuanya gratis & berjalan di browser)
+const EMBED_MODEL = 'Xenova/paraphrase-multilingual-MiniLM-L12-v2'  // pemahaman makna (± 118 MB, sekali unduh)
+const PERSON_MODEL = 'Xenova/yolos-tiny'                            // cadangan jika wajah tidak terlihat
+const MP_VERSION = '0.10.21'
+const MP_BASE = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MP_VERSION}`
+const FACE_MODEL = 'https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite'
+
+// Panjang klip (detik) saat memilih highlight
+const MIN_CLIP = 25, MAX_CLIP = 60, MAX_HIGHLIGHTS = 12
 
 const fmt = n => {
   n = Math.max(0, Number(n) || 0)
@@ -47,18 +55,70 @@ function seekTo(video, t) {
   })
 }
 
-// Pilih titik fokus dari hasil deteksi orang: kalau semua orang muat dalam jendela crop,
-// pusatkan di antara mereka; kalau tidak, ikuti orang yang paling besar di frame.
-function pickFocus(people, axis, cropLen, srcW, srcH) {
-  if (!people.length) return null
+// Pilih titik fokus kamera dari kotak hasil deteksi (wajah atau badan orang).
+// Kalau semua subjek muat dalam jendela crop, pusatkan di antara mereka; kalau tidak,
+// ikuti subjek yang besar dan paling dekat dengan posisi kamera sebelumnya.
+function pickFocus(boxes, axis, cropLen, kind, prev) {
+  if (!boxes.length) return null
   const lo = axis === 'x' ? 'x0' : 'y0', hi = axis === 'x' ? 'x1' : 'y1'
-  const mn = Math.min(...people.map(p => p[lo])), mx = Math.max(...people.map(p => p[hi]))
+  const mn = Math.min(...boxes.map(b => b[lo])), mx = Math.max(...boxes.map(b => b[hi]))
+  // Vertikal: wajah diletakkan sekitar 38% dari atas (ruang kepala), bukan di tengah.
+  const anchor = b => axis === 'x' ? (b.x0 + b.x1) / 2
+    : kind === 'face' ? (b.y0 + b.y1) / 2 + cropLen * 0.12 : b.y0 + (b.y1 - b.y0) * 0.35
   if (mx - mn <= cropLen * 0.9) {
-    // vertikal: condong ke bagian atas (wajah), bukan tengah badan
-    return axis === 'x' ? (mn + mx) / 2 : mn + (mx - mn) * 0.35
+    if (axis === 'x') return (mn + mx) / 2
+    return kind === 'face' ? (mn + mx) / 2 + cropLen * 0.12 : mn + (mx - mn) * 0.35
   }
-  const big = people.reduce((a, b) => (b.x1 - b.x0) * (b.y1 - b.y0) > (a.x1 - a.x0) * (a.y1 - a.y0) ? b : a)
-  return axis === 'x' ? (big.x0 + big.x1) / 2 : big.y0 + (big.y1 - big.y0) * 0.35
+  const area = b => (b.x1 - b.x0) * (b.y1 - b.y0)
+  const maxA = Math.max(...boxes.map(area))
+  const pool = boxes.filter(b => area(b) >= maxA * 0.5)
+  if (prev != null) return anchor(pool.reduce((a, b) => Math.abs(anchor(b) - prev) < Math.abs(anchor(a) - prev) ? b : a))
+  return anchor(pool.reduce((a, b) => area(b) > area(a) ? b : a))
+}
+
+// Potongan (tile) persegi di atas frame, dua skala, supaya wajah kecil di shot lebar tetap terdeteksi.
+function makeTiles(W, H) {
+  const tiles = [], base = Math.min(W, H)
+  for (const s0 of [base, base * 0.5]) {
+    const s = Math.floor(s0), step = Math.max(1, Math.floor(s * 0.7))
+    const pos = L => {
+      const a = []
+      for (let p = 0; p < L - s; p += step) a.push(p)
+      if (!a.length || (L - s) - a[a.length - 1] > step * 0.3) a.push(Math.max(0, L - s))
+      return a
+    }
+    for (const y of pos(H)) for (const x of pos(W)) tiles.push({ x, y, s })
+  }
+  return tiles
+}
+
+// Buang kotak ganda (wajah yang sama terdeteksi di beberapa tile).
+function dedupeBoxes(boxes) {
+  const inside = (c, b) => c[0] > b.x0 && c[0] < b.x1 && c[1] > b.y0 && c[1] < b.y1
+  const ctr = b => [(b.x0 + b.x1) / 2, (b.y0 + b.y1) / 2]
+  const keep = []
+  for (const b of boxes.slice().sort((a, c) => c.score - a.score)) {
+    if (!keep.some(k => inside(ctr(b), k) || inside(ctr(k), b))) keep.push(b)
+  }
+  return keep
+}
+
+function detectFaces(faceDet, cv, tc, tctx) {
+  const out = []
+  for (const t of makeTiles(cv.width, cv.height)) {
+    tctx.drawImage(cv, t.x, t.y, t.s, t.s, 0, 0, tc.width, tc.height)
+    const k = t.s / tc.width
+    for (const d of faceDet.detect(tc).detections || []) {
+      const b = d.boundingBox
+      if (!b) continue
+      out.push({
+        x0: t.x + b.originX * k, y0: t.y + b.originY * k,
+        x1: t.x + (b.originX + b.width) * k, y1: t.y + (b.originY + b.height) * k,
+        score: d.categories?.[0]?.score ?? 1
+      })
+    }
+  }
+  return dedupeBoxes(out)
 }
 
 // Gerakan kamera dibuat halus: median filter, zona mati, dan batas kecepatan pan.
@@ -89,35 +149,55 @@ function sweepTrack(len, cropLen, srcLen) {
 }
 
 // Deteksi subjek pada beberapa titik waktu klip, hasilnya posisi crop per keyframe.
-async function trackSubject({ video, detector, clip, end, geo, srcW, srcH, onProgress }) {
+// Prioritas: wajah (MediaPipe) -> badan orang (YOLOS, dimuat hanya jika perlu) -> tidak ada.
+async function trackSubject({ video, faceDet, getPerson, clip, end, geo, srcW, srcH, onProgress }) {
   const { cw, ch, axis } = geo
   const len = end - clip.start
+  const cropLen = axis === 'x' ? cw : ch, srcLen = axis === 'x' ? srcW : srcH
   const times = []
   for (let t = 0; t < len; t += SAMPLE_STEP) times.push(t)
   times.push(len)
-  const cvs = document.createElement('canvas')
-  const scale = DETECT_WIDTH / srcW
-  cvs.width = DETECT_WIDTH; cvs.height = Math.round(srcH * scale)
-  const ctx = cvs.getContext('2d')
+
+  const scale = Math.min(1, (axis === 'x' ? 1280 : 720) / srcW)
+  const cv = document.createElement('canvas')
+  cv.width = Math.round(srcW * scale); cv.height = Math.round(srcH * scale)
+  const ctx = cv.getContext('2d', { willReadFrequently: false })
+  const tc = document.createElement('canvas'); tc.width = tc.height = 256
+  const tctx = tc.getContext('2d')
+  const pcv = document.createElement('canvas')
+  pcv.width = 640; pcv.height = Math.round(640 * srcH / srcW)
+  const pctx = pcv.getContext('2d')
+
   const focus = []
+  let prev = null
   for (let i = 0; i < times.length; i++) {
     let f = null
     try {
       await seekTo(video, Math.min(clip.start + times[i], Math.max(0, video.duration - 0.05)))
-      ctx.drawImage(video, 0, 0, cvs.width, cvs.height)
-      const blob = await new Promise(r => cvs.toBlob(r, 'image/jpeg', 0.85))
-      const dets = await detector(blob, { threshold: 0.5 })
-      const people = dets.filter(d => d.label === 'person').map(d => ({
-        x0: d.box.xmin / scale, x1: d.box.xmax / scale, y0: d.box.ymin / scale, y1: d.box.ymax / scale
-      }))
-      f = pickFocus(people, axis, axis === 'x' ? cw : ch, srcW, srcH)
+      ctx.drawImage(video, 0, 0, cv.width, cv.height)
+      let boxes = [], kind = 'face'
+      if (faceDet) boxes = detectFaces(faceDet, cv, tc, tctx)
+      if (!boxes.length) {
+        const person = await getPerson()
+        if (person) {
+          pctx.drawImage(cv, 0, 0, pcv.width, pcv.height)
+          const blob = await new Promise(r => pcv.toBlob(r, 'image/jpeg', 0.85))
+          const k = cv.width / pcv.width
+          boxes = (await person(blob, { threshold: 0.5 })).filter(d => d.label === 'person').map(d => ({
+            x0: d.box.xmin * k, x1: d.box.xmax * k, y0: d.box.ymin * k, y1: d.box.ymax * k
+          }))
+          kind = 'person'
+        }
+      }
+      const inSrc = boxes.map(b => ({ x0: b.x0 / scale, x1: b.x1 / scale, y0: b.y0 / scale, y1: b.y1 / scale }))
+      f = pickFocus(inSrc, axis, cropLen, kind, prev)
+      if (f != null) prev = f
     } catch (e) { console.warn('deteksi gagal di', times[i], e) }
     focus.push(f)
     onProgress?.(Math.round((i + 1) / times.length * 100))
   }
-  const cropLen = axis === 'x' ? cw : ch, srcLen = axis === 'x' ? srcW : srcH
   const found = focus.filter(v => v != null).length
-  // Tidak ada orang terdeteksi sama sekali: pan perlahan dari kiri ke kanan (atau atas ke bawah).
+  // Tidak ada subjek terdeteksi sama sekali: pan perlahan dari kiri ke kanan (atau atas ke bawah).
   if (!found) return sweepTrack(len, cropLen, srcLen)
   return { times, pos: smoothPath(focus, SAMPLE_STEP, cropLen, srcLen), found }
 }
@@ -143,8 +223,6 @@ function buildFilter(geo, expr) {
   return `crop=w=${cw}:h=${ch}:x=${x}:y=${y},scale=${OUT_W}:${OUT_H}:flags=bicubic,setsar=1,format=yuv420p`
 }
 
-const safe = s => (s || 'rri-relix').replace(/\.[^.]+$/, '').replace(/[^a-z0-9-_]+/gi, '-').toLowerCase()
-
 // Decode WAV PCM16 mono 16 kHz langsung ke Float32Array.
 // (AudioContext.decodeAudioData akan me-resample ke 44.1/48 kHz sehingga Whisper salah baca.)
 function wavToFloat32(bytes) {
@@ -164,46 +242,22 @@ function wavToFloat32(bytes) {
   return out
 }
 
-// Judul klip otomatis dari kata kunci transkrip (nama/istilah yang sering muncul).
-const STOPWORDS = new Set(('yang dan di ke dari untuk dengan ini itu adalah akan atau pada dalam juga tidak ada kami kita saya anda ' +
-  'mereka dia kamu bisa dapat sudah telah belum masih sangat lebih agar supaya sebagai oleh karena tetapi namun jika kalau maka ' +
-  'sehingga bahwa para suatu setiap semua berbagai antara tentang lalu kemudian selain seperti saat ketika sebuah hal nya lah kah ' +
-  'pun saja hanya harus mau ingin sedang pernah bagi serta terhadap secara hingga sampai selama setelah sebelum menjadi merupakan ' +
-  'yaitu yakni dimana mana siapa apa bagaimana mengapa kenapa iya bukan jangan sama lain lainnya banyak beberapa sekitar punya ' +
-  'memiliki melakukan dilakukan membuat dibuat berdasarkan sebagai dapat akan juga terus selalu sekarang nanti tadi dulu kembali ' +
-  'terima kasih selamat pagi siang sore malam bapak ibu hadirin').split(' '))
+// ---------- Pemilihan highlight ----------
+const endsSentence = t => /[.!?…]["'”’)\]]*$/.test((t || '').trim())
+const dotv = (a, b) => { let x = 0; for (let i = 0; i < a.length; i++) x += a[i] * b[i]; return x }
 
-function makeTitle(text, fallback) {
-  const words = (text || '').split(/\s+/).filter(Boolean)
-  const stat = new Map()
-  words.forEach((raw, i) => {
-    const w = raw.replace(/^[^A-Za-zÀ-ÿ]+|[^A-Za-zÀ-ÿ]+$/g, '')
-    const isAcr = /^[A-Z]{3,}$/.test(w)
-    if (w.length < 5 && !isAcr) return
-    const key = w.toLowerCase()
-    if (STOPWORDS.has(key)) return
-    const prevEnds = i === 0 || /[.!?]$/.test(words[i - 1])
-    const isProper = isAcr || (/^[A-Z]/.test(w) && !prevEnds)
-    const e = stat.get(key) || { word: w, count: 0, proper: false, acr: false, first: i }
-    e.count++; e.proper ||= isProper; e.acr ||= isAcr
-    stat.set(key, e)
-  })
-  const ranked = [...stat.values()]
-    .map(e => ({ ...e, score: e.count * (e.proper ? 2 : 1) * (1 + Math.min(e.word.length, 10) / 20) }))
-    .sort((a, b) => b.score - a.score || a.first - b.first)
-  const pick = []
-  for (const e of ranked) { if (pick.length < 3) pick.push(e) }
-  if (!pick.length) return fallback
-  pick.sort((a, b) => a.first - b.first)
-  const cap = e => e.acr ? e.word.toUpperCase() : e.word.charAt(0).toUpperCase() + e.word.slice(1).toLowerCase()
-  const join = list => list.length > 1 ? `${list.slice(0, -1).join(', ')} dan ${list[list.length - 1]}` : list[0]
-  let items = pick.map(cap), title = `Membahas ${join(items)}`
-  while (title.length > 60 && items.length > 1) { items = items.slice(0, -1); title = `Membahas ${join(items)}` }
-  return title
+function meanNorm(vecs) {
+  const m = new Float32Array(vecs[0].length)
+  for (const v of vecs) for (let i = 0; i < m.length; i++) m[i] += v[i]
+  let n = 0; for (let i = 0; i < m.length; i++) n += m[i] * m[i]
+  n = Math.sqrt(n) || 1
+  for (let i = 0; i < m.length; i++) m[i] /= n
+  return m
 }
 
-function groupHighlights(chunks, totalDuration) {
-  const usable = (chunks || []).map(c => {
+// Segmen Whisper -> daftar {start,end,text} yang valid.
+function normalizeSegments(chunks, totalDuration) {
+  return (chunks || []).map(c => {
     const s = c.timestamp?.[0] ?? c.start ?? 0
     const e = c.timestamp?.[1] ?? c.end
     return {
@@ -212,30 +266,105 @@ function groupHighlights(chunks, totalDuration) {
       text: (c.text || '').trim()
     }
   }).filter(c => c.text && Number.isFinite(c.start) && Number.isFinite(c.end) && c.end > c.start)
-  if (!usable.length) return []
+}
 
-  // Gabungkan segmen berdekatan menjadi kandidat klip ±28–65 detik.
-  const groups = []; let current = null
-  for (const seg of usable) {
-    if (!current) current = { start: seg.start, end: seg.end, text: seg.text, parts: [seg] }
-    else if (seg.start - current.start <= 55 && seg.end - current.start <= 65) {
-      current.end = seg.end; current.text += ' ' + seg.text; current.parts.push(seg)
-    } else { groups.push(current); current = { start: seg.start, end: seg.end, text: seg.text, parts: [seg] } }
-    if (current && current.end - current.start >= 28) { groups.push(current); current = null }
+// Embedding kalimat (model makna), diproses per batch.
+async function embedTexts(embedder, texts, onProgress) {
+  const out = []
+  for (let i = 0; i < texts.length; i += 16) {
+    const t = await embedder(texts.slice(i, i + 16), { pooling: 'mean', normalize: true })
+    for (const row of t.tolist()) out.push(Float32Array.from(row))
+    onProgress?.(Math.round(Math.min(texts.length, i + 16) / texts.length * 100))
   }
-  if (current) groups.push(current)
+  return out
+}
 
-  const terms = ['karena', 'tetapi', 'namun', 'penting', 'harus', 'jangan', 'ternyata', 'menurut', 'masyarakat', 'generasi', 'kesimpulan', 'pertama', 'kedua', 'berarti', 'solusi', 'masalah', 'kita', 'saya', 'anda', 'bagaimana', 'mengapa']
-  return groups.filter(g => g.end - g.start >= 8).map(g => {
-    const lower = g.text.toLowerCase()
-    const hits = terms.filter(t => lower.includes(t)).length
-    const words = g.text.split(/\s+/).length
-    const score = Math.min(99, Math.round(45 + Math.min(words, 90) * .35 + hits * 3 + (/[!?]/.test(g.text) ? 5 : 0)))
-    return {
-      ...g, id: crypto.randomUUID(), score, rendered: false, url: ''
+const HEUR_TERMS = ['karena', 'tetapi', 'namun', 'penting', 'harus', 'jangan', 'ternyata', 'menurut', 'masyarakat', 'generasi', 'kesimpulan', 'pertama', 'kedua', 'berarti', 'solusi', 'masalah', 'kita', 'saya', 'anda', 'bagaimana', 'mengapa']
+function heuristic(text) {
+  const lower = text.toLowerCase()
+  const hits = HEUR_TERMS.filter(t => lower.includes(t)).length
+  const words = text.split(/\s+/).length
+  const raw = 45 + Math.min(words, 90) * .35 + hits * 3 + (/[!?]/.test(text) ? 5 : 0)
+  return clamp((raw - 45) / 54, 0, 1)
+}
+
+// Semua kandidat klip yang diawali di awal kalimat dan DIAKHIRI di akhir kalimat.
+function makeCandidates(segs, minLen, maxLen) {
+  const ratio = segs.filter(x => endsSentence(x.text)).length / segs.length
+  const hasPunct = ratio >= 0.2          // transkrip tanpa tanda baca: pakai batas segmen saja
+  const cands = []
+  for (let i = 0; i < segs.length; i++) {
+    if (hasPunct && i > 0 && !endsSentence(segs[i - 1].text)) continue
+    let first = -1, last = -1, fb = -1
+    for (let j = i; j < segs.length; j++) {
+      const dur = segs[j].end - segs[i].start
+      if (dur > maxLen) break
+      if (fb < 0 && dur >= minLen) fb = j
+      if (dur >= minLen && (!hasPunct || endsSentence(segs[j].text) || j === segs.length - 1)) {
+        if (first < 0) first = j
+        last = j
+      }
     }
-  }).sort((a, b) => b.score - a.score).slice(0, 12)
-    .map((g, i) => ({ ...g, title: makeTitle(g.text, `Highlight ${String(i + 1).padStart(2, '0')}`) }))
+    const ends = new Set()
+    if (first >= 0) { ends.add(first); ends.add(last) } else if (fb >= 0) ends.add(fb)
+    for (const j of ends) cands.push({ i, j })
+  }
+  return cands
+}
+
+// Pilih highlight: batas di akhir kalimat, skor makna (embedding) + heuristik, tanpa klip yang tumpang tindih
+// dan tanpa klip yang isinya terlalu mirip (MMR).
+function pickHighlights(segs, totalDuration, embeds) {
+  if (!segs.length) return []
+  let cands = makeCandidates(segs, MIN_CLIP, MAX_CLIP)
+  if (!cands.length) cands = makeCandidates(segs, 8, MAX_CLIP)
+  if (!cands.length) return []
+
+  const useEmb = Array.isArray(embeds) && embeds.length === segs.length
+  const globalEmb = useEmb ? meanNorm(embeds) : null
+  const items = cands.map(({ i, j }) => {
+    const part = segs.slice(i, j + 1)
+    const text = part.map(x => x.text).join(' ')
+    const c = {
+      start: Math.max(0, segs[i].start - 0.15),
+      end: totalDuration ? Math.min(totalDuration, segs[j].end + 0.35) : segs[j].end + 0.35,
+      text, h: heuristic(text)
+    }
+    if (useEmb) {
+      const vs = embeds.slice(i, j + 1)
+      c.emb = meanNorm(vs)
+      c.cen = dotv(c.emb, globalEmb)                                        // seberapa mewakili inti pembahasan
+      c.coh = vs.reduce((a, v) => a + dotv(v, c.emb), 0) / vs.length        // seberapa fokus pada satu topik
+    }
+    return c
+  }).filter(c => c.end - c.start >= 5)
+  if (!items.length) return []
+
+  const norm = key => {
+    const vals = items.map(c => c[key]), lo = Math.min(...vals), hi = Math.max(...vals)
+    items.forEach(c => { c[key + 'N'] = hi > lo ? (c[key] - lo) / (hi - lo) : 0.5 })
+  }
+  if (useEmb) { norm('cen'); norm('coh') }
+  items.forEach(c => { c.final = useEmb ? 0.4 * c.cenN + 0.35 * c.cohN + 0.25 * c.h : c.h })
+
+  const picked = []
+  let pool = items.slice()
+  while (picked.length < MAX_HIGHLIGHTS && pool.length) {
+    let best = null, bestVal = -Infinity
+    for (const c of pool) {
+      let sim = 0
+      if (useEmb) for (const p of picked) sim = Math.max(sim, dotv(c.emb, p.emb))
+      const val = c.final - 0.6 * Math.max(0, sim - 0.55)
+      if (val > bestVal) { bestVal = val; best = c }
+    }
+    if (!best) break
+    picked.push(best)
+    pool = pool.filter(c => !(c.start < best.end && c.end > best.start))   // buang yang tumpang tindih
+  }
+  return picked.sort((a, b) => b.final - a.final).map(c => ({
+    id: crypto.randomUUID(), start: c.start, end: c.end, text: c.text,
+    score: Math.min(99, Math.round(50 + 49 * c.final)), rendered: false, url: ''
+  }))
 }
 
 function App() {
@@ -245,7 +374,7 @@ function App() {
   const [status, setStatus] = useState('Upload rekaman siaran untuk memulai.'), [error, setError] = useState('')
   const [modelReady, setModelReady] = useState(false)
   const videoRef = useRef(null), inputRef = useRef(null)
-  const ffmpegRef = useRef(null), detectorRef = useRef(null), dimsRef = useRef({ w: 0, h: 0 }), urlRef = useRef(''), clipsRef = useRef([])
+  const ffmpegRef = useRef(null), faceRef = useRef(null), personRef = useRef(null), personFailRef = useRef(false), embRef = useRef(null), dimsRef = useRef({ w: 0, h: 0 }), urlRef = useRef(''), clipsRef = useRef([])
 
   urlRef.current = url
   clipsRef.current = clips
@@ -255,6 +384,7 @@ function App() {
     if (urlRef.current) URL.revokeObjectURL(urlRef.current)
     clipsRef.current.forEach(c => c.url && URL.revokeObjectURL(c.url))
     ffmpegRef.current?.terminate()
+    try { faceRef.current?.close() } catch {}
   }, [])
 
   // Peringatan sebelum refresh/tutup tab jika ada proses atau klip yang belum diunduh.
@@ -313,6 +443,46 @@ function App() {
     return f
   }
 
+  const dlProgress = p => {
+    if (p.status === 'progress' && p.total) setProgress(Math.round(p.loaded / p.total * 100))
+  }
+
+  // Model makna (embedding) untuk memilih highlight. Gagal -> kembali ke skor heuristik.
+  async function loadEmbedder() {
+    if (embRef.current) return embRef.current
+    try {
+      try { embRef.current = await pipeline('feature-extraction', EMBED_MODEL, { dtype: 'q8', progress_callback: dlProgress }) }
+      catch { embRef.current = await pipeline('feature-extraction', EMBED_MODEL, { progress_callback: dlProgress }) }
+    } catch (e) { console.warn('Model makna gagal dimuat, memakai skor sederhana.', e) }
+    return embRef.current
+  }
+
+  // Detektor wajah MediaPipe (dimuat dari CDN). Gagal -> pakai deteksi badan orang / pan.
+  async function loadFaceDetector() {
+    if (faceRef.current) return faceRef.current
+    try {
+      const mp = await import(/* @vite-ignore */ `${MP_BASE}/vision_bundle.mjs`)
+      const vision = await mp.FilesetResolver.forVisionTasks(`${MP_BASE}/wasm`)
+      faceRef.current = await mp.FaceDetector.createFromOptions(vision, {
+        baseOptions: { modelAssetPath: FACE_MODEL, delegate: 'CPU' },
+        runningMode: 'IMAGE', minDetectionConfidence: 0.55
+      })
+    } catch (e) { console.warn('Detektor wajah gagal dimuat.', e) }
+    return faceRef.current
+  }
+
+  // Detektor badan orang: hanya dimuat saat ada frame tanpa wajah terdeteksi.
+  async function getPerson() {
+    if (personRef.current) return personRef.current
+    if (personFailRef.current) return null
+    try {
+      setStatus('Memuat AI cadangan untuk mendeteksi orang...')
+      try { personRef.current = await pipeline('object-detection', PERSON_MODEL, { dtype: 'q8', progress_callback: dlProgress }) }
+      catch { personRef.current = await pipeline('object-detection', PERSON_MODEL, { progress_callback: dlProgress }) }
+    } catch (e) { console.warn('Detektor orang gagal dimuat.', e); personFailRef.current = true }
+    return personRef.current
+  }
+
   async function transcribe() {
     if (!file || busy) return
     setBusy(true); setError(''); setProgress(0)
@@ -353,7 +523,23 @@ function App() {
         chunk_length_s: 30, stride_length_s: 5,
         return_timestamps: true, language: 'indonesian', task: 'transcribe'
       })
-      const candidates = groupHighlights(result.chunks || [], duration)
+      const segs = normalizeSegments(result.chunks || [], duration)
+
+      // 3b. Pahami makna tiap kalimat untuk memilih momen terbaik
+      let embeds = null
+      if (segs.length) {
+        setPhase('Memuat AI makna'); setProgress(0)
+        setStatus('Memuat model pemahaman makna (sekali unduh, tersimpan di browser)...')
+        const embedder = await loadEmbedder()
+        if (embedder) {
+          try {
+            setPhase('Menganalisis makna'); setProgress(0)
+            setStatus('Menilai topik dan inti pembahasan tiap bagian...')
+            embeds = await embedTexts(embedder, segs.map(x => x.text), setProgress)
+          } catch (e) { console.warn('Embedding gagal.', e); embeds = null }
+        }
+      }
+      const candidates = pickHighlights(segs, duration, embeds)
       if (!candidates.length) throw new Error('Tidak ditemukan kandidat highlight. Pastikan video memiliki audio percakapan yang jelas.')
       setClips(candidates)
 
@@ -361,19 +547,11 @@ function App() {
       const { w: srcW, h: srcH } = dimsRef.current
       const geo = cropGeometry(srcW, srcH)
 
-      let detector = detectorRef.current
-      if (!detector && geo.axis) {
-        setPhase('Memuat AI deteksi subjek'); setProgress(0)
-        setStatus('Mengunduh model deteksi subjek untuk auto-reframe...')
-        try {
-          const cb = p => { if (p.status === 'progress' && p.total) setProgress(Math.round(p.loaded / p.total * 100)) }
-          try { detector = await pipeline('object-detection', DETECT_MODEL, { dtype: 'q8', progress_callback: cb }) }
-          catch { detector = await pipeline('object-detection', DETECT_MODEL, { progress_callback: cb }) }
-          detectorRef.current = detector
-        } catch (e) {
-          console.warn('Model deteksi gagal dimuat, memakai crop tengah.', e)
-          detector = null
-        }
+      let faceDet = null
+      if (geo.axis) {
+        setPhase('Memuat AI deteksi wajah'); setProgress(0)
+        setStatus('Memuat detektor wajah untuk auto-reframe...')
+        faceDet = await loadFaceDetector()
       }
 
       // elemen video terpisah untuk mengambil frame analisis
@@ -394,16 +572,14 @@ function App() {
             if (geo.axis) {
               const axisLen = geo.axis === 'x' ? srcW : srcH, cropLen = geo.axis === 'x' ? geo.cw : geo.ch
               track = sweepTrack(len, cropLen, axisLen)   // cadangan jika model deteksi tidak tersedia
-              if (detector) {
-                setPhase(`Reframing klip ${i + 1}/${candidates.length}`); setProgress(0)
-                setStatus(`Mencari subjek utama di ${c.title}...`)
-                track = await trackSubject({ video: probe, detector, clip: c, end, geo, srcW, srcH, onProgress: setProgress })
-              }
+              setPhase(`Reframing klip ${i + 1}/${candidates.length}`); setProgress(0)
+              setStatus(`Mencari subjek utama di Highlight ${String(i + 1).padStart(2, '0')}...`)
+              track = await trackSubject({ video: probe, faceDet, getPerson, clip: c, end, geo, srcW, srcH, onProgress: setProgress })
             }
 
             // b. potong + crop 9:16 + encode
             setPhase(`Render klip ${i + 1}/${candidates.length}`); setProgress(0)
-            setStatus(`Membuat video portrait: ${c.title} (${fmt(c.start)} – ${fmt(c.end)})...`)
+            setStatus(`Membuat video portrait: Highlight ${String(i + 1).padStart(2, '0')} (${fmt(c.start)} – ${fmt(c.end)})...`)
             const rc2 = await engine.exec([
               '-ss', String(c.start), '-i', src, '-t', String(len),
               '-vf', buildFilter(geo, panExpr(track.times, track.pos)),
@@ -439,10 +615,12 @@ function App() {
     }
   }
 
-  function update(id, patch) { setClips(prev => prev.map(c => c.id === id ? { ...c, ...patch } : c)) }
-  function download(c) {
+  const mmss = n => `${String(Math.floor(n / 60)).padStart(2, '0')}m${String(Math.floor(n % 60)).padStart(2, '0')}`
+  function download(c, i) {
     if (!c.url) return
-    const a = document.createElement('a'); a.href = c.url; a.download = `${safe(c.title)}.mp4`; a.click()
+    const a = document.createElement('a'); a.href = c.url
+    a.download = `highlight-${String(i + 1).padStart(2, '0')}_${mmss(c.start)}-${mmss(c.end)}.mp4`
+    a.click()
   }
   function clear() {
     if (busy) return
@@ -461,23 +639,22 @@ function App() {
           <input ref={inputRef} hidden type="file" accept="video/*" onChange={e => selectFile(e.target.files?.[0])} />
         </div>
         <div className="panel"><div className="panelhead"><div><small>02 / AI ENGINE</small><h2>Analyze broadcast</h2></div><Sparkles /></div>
-          <div className="ai-card"><div className="ai-icon"><WandSparkles /></div><div><b>Whisper AI · Multilingual</b><p>Transkripsi Bahasa Indonesia, deteksi highlight, lalu klip otomatis dipotong portrait 9:16 dengan auto-reframe mengikuti subjek.</p></div></div>
+          <div className="ai-card"><div className="ai-icon"><WandSparkles /></div><div><b>Whisper AI · Multilingual</b><p>Transkripsi Bahasa Indonesia, pemilihan momen berdasarkan makna, lalu klip otomatis dipotong portrait 9:16 mengikuti wajah.</p></div></div>
           <div className="modelrow"><span><Cpu size={15} /> AI model</span><b>{modelReady ? 'Loaded in browser' : 'Whisper Small · multilingual'}</b></div>
           <button className="primary" onClick={transcribe} disabled={!file || !duration || busy}><Sparkles size={16} />{busy ? 'AI sedang bekerja...' : 'Generate AI Highlights'}</button>
           <p className="hint">Model AI diunduh saat pertama kali digunakan dan tersimpan di cache browser. Jangan tutup tab selama proses berjalan.</p>
         </div>
       </section>
       <section className="panel results">
-        <div className="resulthead"><div><small>03 / AI OUTPUT</small><h2>Highlight results <em>{clips.length}</em></h2><p>Klip dirender otomatis dalam format portrait 9:16 dengan auto-reframe pada subjek. Judul klip bisa diedit sebelum diunduh.</p></div><button className="outline" onClick={clear} disabled={!file || busy}><Trash2 size={14} /> Clear</button></div>
+        <div className="resulthead"><div><small>03 / AI OUTPUT</small><h2>Highlight results <em>{clips.length}</em></h2><p>Klip dipilih berdasarkan makna, dipotong di akhir kalimat, dan dirender otomatis portrait 9:16 dengan auto-reframe pada wajah.</p></div><button className="outline" onClick={clear} disabled={!file || busy}><Trash2 size={14} /> Clear</button></div>
         {!clips.length ? <div className="empty"><div><Scissors size={25} /></div><b>No highlights generated</b><span>Upload video lalu jalankan AI untuk menemukan kandidat momen menarik.</span></div> :
           <div className="clipgrid">{clips.map((c, i) => <article className="clip chosen" key={c.id}>
             <div className="cliptop"><b>HIGHLIGHT {String(i + 1).padStart(2, '0')}</b><span className="score">AI {c.score}%</span></div>
-            <input className="titleinput" value={c.title} onChange={e => update(c.id, { title: e.target.value })} />
             <div className="clipmeta"><span><Clock3 size={13} />{fmt(c.start)} – {fmt(c.end)}</span><span>{fmt(c.end - c.start)}</span></div>
             {c.url && <video className="preview" src={c.url} controls style={{ maxHeight: 460, aspectRatio: "9 / 16", margin: "0 auto", display: "block", background: "#000" }} />}
             <div className="clipbuttons">
               {c.rendered
-                ? <button className="download" onClick={() => download(c)}><Download size={14} /> Download MP4</button>
+                ? <button className="download" onClick={() => download(c, i)}><Download size={14} /> Download MP4</button>
                 : <span className="hint">{busy ? 'Menunggu proses otomatis...' : 'Render gagal'}</span>}
             </div>
           </article>)}</div>}
